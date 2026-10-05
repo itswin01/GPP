@@ -244,7 +244,10 @@ class DSPyPhysicsExtractor:
             api_key=api_key,
             api_base=api_base,
             temperature=0.1,
-            max_tokens=700,
+            # Reasoning-style models (gpt-oss-*, qwen3) emit chain-of-thought
+            # tokens before the JSON, so a small budget truncates the payload
+            # mid-object and every extraction fails as "not valid JSON".
+            max_tokens=int(os.environ.get("GROQ_MAX_TOKENS", "4000")),
         )
         dspy.configure(lm=lm)
         self.extract_program = dspy.Predict(_build_signature())#So now self.extract_program behaves like a Python function:

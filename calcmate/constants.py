@@ -23,6 +23,31 @@ UNIT_BY_SYMBOL = {
 }
 CANONICAL_SYMBOLS = set(UNIT_BY_SYMBOL)
 
+# Pint-parseable canonical dimension for every symbol that can appear in a
+# graph equation. Used by calcmate.verification.DimensionalVerifier to check
+# that each equation is dimensionally balanced (LHS dimension == RHS
+# dimension) and that every substituted quantity carries a dimensionally
+# consistent unit. Kept as a separate table from UNIT_BY_SYMBOL because a
+# *dimension* check must accept any compatible unit ("km" for a length),
+# while UNIT_BY_SYMBOL names the one canonical SI unit we solve in.
+SYMBOL_DIMENSIONS = {
+    "u": "meter/second",
+    "v": "meter/second",
+    "a": "meter/second**2",
+    "t": "second",
+    "s": "meter",
+    "speed": "meter/second",
+    "distance": "meter",
+    "time": "second",
+    "avg_v": "meter/second",
+    "v1": "meter/second",
+    "v2": "meter/second",
+    "relative_speed": "meter/second",
+    "separation": "meter",
+    # A relative-direction factor (+1 opposite, -1 same) is a pure number.
+    "direction": "dimensionless",
+}
+
 # Base accepted spellings for each canonical symbol. These no longer need to
 # enumerate every surface variant (plural, hyphenation, verb tense) - they
 # are compiled into tolerant regex patterns below via SYMBOL_ALIAS_PATTERNS.

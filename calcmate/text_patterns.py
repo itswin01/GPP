@@ -51,6 +51,17 @@ def compile_phrase_set(phrases) -> re.Pattern[str]:
     return re.compile("|".join(fragments), re.IGNORECASE)
 
 
+def any_phrase_present(phrases, text: str) -> bool:
+    """True when at least one accepted phrase actually occurs in ``text``.
+
+    The corroboration test used before a constraint is allowed to inject an
+    implied value. Deliberately checked against the *raw problem text* rather
+    than any self-reported phrase list, so a constraint can only fire on
+    evidence the problem itself supplies.
+    """
+    return bool(phrases) and compile_phrase_set(phrases).search(text) is not None
+
+
 def fullmatch_any(text: str, phrases) -> bool:
     normalized = text.strip().lower()
     return any(re.fullmatch(phrase_to_pattern(phrase), normalized, re.IGNORECASE) for phrase in phrases)

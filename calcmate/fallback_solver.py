@@ -20,7 +20,9 @@ import sympy as sp
 from calcmate.case_graph import load_all_cases, load_embeddings, nearest_cases
 from calcmate.constants import CANONICAL_SYMBOLS, UNIT_BY_SYMBOL
 from calcmate.knowledge_graph import PhysicsKnowledgeGraph
+from calcmate.reasoning import _CONDITIONAL_EQUATIONS
 from calcmate.models import ExtractedProblem, PhaseTrace, RetrievedCase, SolutionStep
+from calcmate.text_patterns import any_phrase_present
 
 _SYMPY_SYMBOLS = {name: sp.Symbol(name) for name in CANONICAL_SYMBOLS}
 
@@ -97,9 +99,19 @@ class CaseFallbackSolver:
 
     def _try_case(self, problem: ExtractedProblem, case: dict) -> FallbackResult | None:
         quantities = {symbol: quantity.value for symbol, quantity in problem.quantities.items()}
-        implied_values = case.get("implied_values") or {}
         applied_constraints: list[str] = []
+        # A borrowed case may only inject its implied values if THIS problem's
+        # text independently supports the constraints behind them - the same
+        # bar PhysicsReasoner._apply_case_suggested_constraints applies.
+        # Without it a structurally similar case silently asserts physics the
+        # problem never stated: "an object moves for 5 s, how far?" matches a
+        # free-fall case on {t}->s alone, and borrowing its u=0 / a=-9.8
+        # returns a confident -122.5 m for a problem that never mentions
+        # falling. An under-constrained problem must stay under-constrained.
+        implied_values = case.get("implied_values") or {}
         if implied_values:
+            if not self._constraints_corroborated(problem, case.get("constraints_fired") or []):
+                return None
             for symbol, value in implied_values.items():
                 quantities.setdefault(symbol, float(value))
             applied_constraints = list(case.get("constraints_fired") or [])
@@ -108,6 +120,13 @@ class CaseFallbackSolver:
         for equation_id in case.get("equations_used") or []:
             attrs = self._equation_attrs(equation_id)
             if attrs is None:
+                continue
+            # An equation that is only valid under a specific constraint
+            # (eq_time_of_flight assumes a projectile returning to its launch
+            # height) must not become usable just because a similar case
+            # happened to use it. Same gate the graph solver applies.
+            required = _CONDITIONAL_EQUATIONS.get(equation_id)
+            if required is not None and not self._constraints_corroborated(problem, [required]):
                 continue
             symbols = set(attrs["symbols"])
             if target not in symbols:
@@ -132,6 +151,21 @@ class CaseFallbackSolver:
             )
             return FallbackResult(steps=[step], source_case_id=case["case_id"], applied_constraints=applied_constraints)
         return None
+
+    def _constraints_corroborated(self, problem: ExtractedProblem, constraint_ids: list[str]) -> bool:
+        """Every constraint the borrowed case relied on must have one of its
+        own trigger phrases present in this problem's text."""
+        if not constraint_ids:
+            return False
+        raw_text = problem.raw_text.lower()
+        for constraint_id in constraint_ids:
+            try:
+                attrs = self.graph.node(constraint_id)
+            except KeyError:
+                return False
+            if not any_phrase_present(attrs.get("trigger_phrases", []), raw_text):
+                return False
+        return True
 
     def _equation_attrs(self, equation_id: str) -> dict | None:
         try:

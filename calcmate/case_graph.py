@@ -33,6 +33,8 @@ DEFAULT_CASE_PATHS = [
     PROJECT_ROOT / "data" / "cases" / "kinematics_cases.jsonl",
     PROJECT_ROOT / "data" / "cases" / "kinematics_suvat_cases.jsonl",
 ]
+# Schema-v2 corpus: one file per grade band, every *.jsonl in the directory.
+DEFAULT_CASE_DIRS = [PROJECT_ROOT / "data" / "cases" / "kinematics"]
 DEFAULT_EMBEDDINGS_PATH = PROJECT_ROOT / "data" / "cases" / "node2vec_embeddings.json"
 
 # Similarity weights: how much each shared structural attribute contributes
@@ -50,18 +52,66 @@ _WEIGHTS = {
 _EDGE_THRESHOLD = 1.0
 
 
-def load_all_cases(paths: list[Path] | None = None) -> list[dict]:
-    """Load and de-duplicate (by case_id) every case across the dataset files."""
+def normalize_case(data: dict) -> dict:
+    """Bring a schema-v2 case up to the flat shape the rest of the code reads.
+
+    Two case schemas exist in the corpus. The flat one states its structure
+    directly (``known_symbols``/``unknown``/``equations_used``/
+    ``constraints_fired``); the v2 one states it as a ``reasoning_program`` of
+    opcodes, with knowns under ``givens`` and the target under ``target``.
+
+    Every consumer downstream - the node2vec similarity graph, the TF-IDF
+    retriever, and CaseFallbackSolver - reads the flat fields. Rather than
+    teach each of them both schemas, derive the flat fields once here from the
+    opcode program, so "structurally similar case" means the same thing across
+    both corpora. ``reasoning_program`` is passed through untouched so
+    scripts/replay_validate.py can still execute v2 cases through the VM.
+    """
+    if "reasoning_program" not in data and "givens" not in data:
+        return data
+
+    program = data.get("reasoning_program", []) or []
+    givens = data.get("givens", {}) or {}
+    target = data.get("target", {}) or {}
+
+    normalized = dict(data)
+    normalized.setdefault("domain", data.get("chapter", "kinematics"))
+    normalized["known_symbols"] = sorted(givens)
+    normalized["unknown"] = target.get("symbol", "")
+    normalized["equations_used"] = [op["equation"] for op in program if op.get("op") == "solve_equation"]
+    normalized["constraints_fired"] = [op["constraint"] for op in program if op.get("op") == "apply_constraint"]
+    normalized["law_nodes"] = [op["law"] for op in program if op.get("op") == "identify_law"]
+    # v2 states constraints by id and lets the graph supply what they imply,
+    # so there is no per-case implied-value map to carry over.
+    normalized.setdefault("implied_values", {})
+    return normalized
+
+
+def load_all_cases(
+    paths: list[Path] | None = None, directories: list[Path] | None = None
+) -> list[dict]:
+    """Load and de-duplicate (by case_id) every case across both corpora.
+
+    Accepts the flat-schema files and the schema-v2 chapter directory; every
+    record comes back in the flat shape (see :func:`normalize_case`).
+    """
     cases: dict[str, dict] = {}
-    for path in paths or DEFAULT_CASE_PATHS:
-        if not path.exists():
-            continue
+
+    def _ingest(path: Path) -> None:
         for raw_line in path.read_text(encoding="utf-8").splitlines():
             line = raw_line.strip()
             if not line:
                 continue
-            data = json.loads(line)
+            data = normalize_case(json.loads(line))
             cases.setdefault(data["case_id"], data)
+
+    for path in DEFAULT_CASE_PATHS if paths is None else paths:
+        if path.exists():
+            _ingest(path)
+    for directory in DEFAULT_CASE_DIRS if directories is None else directories:
+        if directory.is_dir():
+            for path in sorted(directory.glob("*.jsonl")):
+                _ingest(path)
     return list(cases.values())
 
 

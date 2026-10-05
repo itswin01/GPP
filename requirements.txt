@@ -1,11 +1,17 @@
 fastapi
 uvicorn
+# server.py calls load_dotenv() at import time, so this is required to start
+# the app at all - not just to read a .env file.
+python-dotenv
 networkx
 sympy
 pydantic
 dspy
 pint
 numpy
+# TfidfCaseRetriever is the DEFAULT retrieval backend (CALCMATE_RETRIEVAL_BACKEND
+# is unset in most setups), so scikit-learn is a hard requirement, not optional.
+scikit-learn
 sentence-transformers
 faiss-cpu
 torch

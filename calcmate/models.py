@@ -56,6 +56,9 @@ class SolutionStep:
     solved_symbol: str
     value: float
     unit: str
+    # Full-precision value before display rounding; used for downstream unit
+    # conversion so the conversion does not inherit 4-dp rounding error.
+    raw_value: float | None = None
 
 
 @dataclass(frozen=True)
@@ -70,6 +73,15 @@ class RetrievedCase:
     equations_used: list[str]
     law_nodes: list[str]
     score: float
+    solution_steps: list[str] = field(default_factory=list)
+    final_answer: dict[str, Any] = field(default_factory=dict)
+    # The gold opcode program (schema-v2 cases only). Preserved so
+    # scripts/replay_validate.py can re-execute the case through the
+    # reasoning-program VM; flat-schema cases leave it empty.
+    reasoning_program: list[dict[str, Any]] = field(default_factory=list)
+    # Optional decomposition of ``score`` into its hybrid components, populated
+    # by retrievers that fuse semantic and structural signals.
+    score_breakdown: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -95,6 +107,7 @@ class AttemptLog:
     constraints_fired: list[str]
     was_under_constrained: bool
     was_contradiction: bool
+    was_unresolved: bool = False
 
 
 @dataclass(frozen=True)
@@ -104,7 +117,9 @@ class Solution:
     applied_constraints: list[str]
     steps: list[SolutionStep]
     answer_symbol: str
-    answer_value: float
+    # None when the attempt ended unresolved: no verified answer was produced,
+    # and no unverified number is substituted in its place.
+    answer_value: float | None
     answer_unit: str
     law_nodes: list[str]
     narration: str
@@ -113,6 +128,7 @@ class Solution:
     phase_trace: list[PhaseTrace] = field(default_factory=list)
     was_under_constrained: bool = False
     was_contradiction: bool = False
+    was_unresolved: bool = False
     fallback_case_id: str | None = None
 
     def to_jsonable(self) -> dict[str, Any]:
@@ -163,5 +179,6 @@ class Solution:
             ],
             "was_under_constrained": self.was_under_constrained,
             "was_contradiction": self.was_contradiction,
+            "was_unresolved": self.was_unresolved,
             "fallback_case_id": self.fallback_case_id,
         }

@@ -5,6 +5,7 @@ from dataclasses import asdict, replace
 from pathlib import Path
 from typing import Protocol
 
+from calcmate.case_graph import normalize_case
 from calcmate.models import ExtractedProblem, RetrievedCase
 
 
@@ -39,27 +40,45 @@ def case_to_text(case: RetrievedCase | dict) -> str:
     return " | ".join(parts)
 
 
+def case_from_dict(data: dict) -> RetrievedCase:
+    """Build a RetrievedCase from either corpus schema.
+
+    normalize_case() derives the flat structural fields from a schema-v2
+    ``reasoning_program`` when needed, so both corpora land on one shape here.
+    """
+    data = normalize_case(data)
+    return RetrievedCase(
+        case_id=data["case_id"],
+        problem_text=data.get("problem_text", ""),
+        known_symbols={str(raw).split("=")[0].strip() for raw in data.get("known_symbols", []) or []},
+        unknown=data.get("unknown", ""),
+        domain=data.get("domain", data.get("chapter", "")),
+        constraints_fired=list(data.get("constraints_fired", []) or []),
+        implied_values=dict(data.get("implied_values", {}) or {}),
+        equations_used=list(data.get("equations_used", []) or []),
+        law_nodes=list(data.get("law_nodes", []) or []),
+        score=float(data.get("score", 0.0)),
+        solution_steps=list(data.get("solution_steps", []) or []),
+        final_answer=dict(data.get("final_answer", {}) or {}),
+        reasoning_program=list(data.get("reasoning_program", []) or []),
+    )
+
+
 def load_cases_jsonl(path: Path | str) -> list[RetrievedCase]:
     cases: list[RetrievedCase] = []
     for raw_line in Path(path).read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line:
             continue
-        data = json.loads(line)
-        cases.append(
-            RetrievedCase(
-                case_id=data["case_id"],
-                problem_text=data["problem_text"],
-                known_symbols=set(data["known_symbols"]),
-                unknown=data["unknown"],
-                domain=data.get("domain", data.get("chapter")),
-                constraints_fired=list(data.get("constraints_fired", [])),
-                implied_values=dict(data.get("implied_values", {})),
-                equations_used=list(data.get("equations_used", [])),
-                law_nodes=list(data.get("law_nodes", [])),
-                score=float(data.get("score", 0.0)),
-            )
-        )
+        cases.append(case_from_dict(json.loads(line)))
+    return cases
+
+
+def load_cases_dir(directory: Path | str) -> list[RetrievedCase]:
+    """Load and concatenate every ``*.jsonl`` file in a chapter case directory."""
+    cases: list[RetrievedCase] = []
+    for path in sorted(Path(directory).glob("*.jsonl")):
+        cases.extend(load_cases_jsonl(path))
     return cases
 
 
@@ -257,7 +276,7 @@ class TfidfCaseRetriever:
         from calcmate.case_graph import load_all_cases
 
         raw_cases = cases if cases is not None else load_all_cases()
-        self.cases: list[RetrievedCase] = [self._to_retrieved_case(case) for case in raw_cases]
+        self.cases: list[RetrievedCase] = [case_from_dict(case) for case in raw_cases]
         texts = [self._case_text(case) for case in raw_cases]
 
         from sklearn.feature_extraction.text import TfidfVectorizer
@@ -309,26 +328,6 @@ class TfidfCaseRetriever:
                 " ".join(case.get("equations_used", []) or []),
                 " ".join(case.get("constraints_fired", []) or []),
             ]
-        )
-
-    @staticmethod
-    def _known_symbols(case: dict) -> set[str]:
-        # Older records store "symbol=value" strings; newer ones store
-        # plain symbols. Normalize to the bare symbol either way.
-        return {str(raw).split("=")[0].strip() for raw in case.get("known_symbols", []) or []}
-
-    def _to_retrieved_case(self, case: dict) -> RetrievedCase:
-        return RetrievedCase(
-            case_id=case["case_id"],
-            problem_text=case.get("problem_text", ""),
-            known_symbols=self._known_symbols(case),
-            unknown=case.get("unknown", ""),
-            domain=case.get("domain", case.get("chapter", "")),
-            constraints_fired=list(case.get("constraints_fired", []) or []),
-            implied_values=dict(case.get("implied_values", {}) or {}),
-            equations_used=list(case.get("equations_used", []) or []),
-            law_nodes=list(case.get("law_nodes", []) or []),
-            score=0.0,
         )
 
     def _structural_score(self, problem: ExtractedProblem, case: RetrievedCase) -> float:

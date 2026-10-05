@@ -1,7 +1,14 @@
+import os
 import unittest
 
-from calcmate.models import ExtractedProblem, Quantity
-from calcmate.pipeline import CalcMatePipeline
+# Tests must be hermetic no matter what the developer's environment holds.
+# The extractor is faked below, but the narrator is not: with GROQ_API_KEY
+# set anywhere in the environment, Narrator() would build a live DSPy program
+# and every pipeline test would make real network calls.
+os.environ["CALCMATE_USE_DSPY_NARRATOR"] = "0"
+
+from calcmate.models import ExtractedProblem, Quantity  # noqa: E402
+from calcmate.pipeline import CalcMatePipeline  # noqa: E402
 
 
 class FixtureExtractor:

@@ -10,6 +10,7 @@ from calcmate.models import ExtractedProblem, PhaseTrace, Quantity, RetrievedCas
 from calcmate.overlay import Overlay
 from calcmate.text_patterns import compile_phrase, compile_phrase_set
 from calcmate.unit_validation import UnitValidator
+from calcmate.verification import DimensionalVerifier
 
 # Base accepted phrasings for meta-rule fallbacks, compiled into regex so
 # variants ("dropping", "started from rest") are caught without listing
@@ -28,6 +29,40 @@ _FROM_REST_PATTERN = compile_phrase_set(["from rest", "dropped"])
 # explicitly on the constraint that actually justifies its physics.
 _CONDITIONAL_EQUATIONS: dict[str, str] = {
     "eq_time_of_flight": "constraint_free_fall_upward_a_minus_g",
+}
+
+# eq_s_vt ("s = v*t") is the *uniform motion* distance law: it holds only when
+# velocity is constant, i.e. a = 0. Left ungated it also matches accelerated
+# problems, where v is the FINAL velocity rather than a constant one - and
+# because the solver commits to the first equation that reaches the target, it
+# wins the race against the correct equation. Worst case, a constraint has
+# already set v=0 ("comes to rest", "maximum height") and the borrowed law
+# confidently returns s = 0*t = 0 m.
+_ZERO_ACCELERATION_EQUATIONS = {"eq_s_vt"}
+
+
+def _has_nonzero_acceleration(quantities: dict[str, Quantity] | None) -> bool:
+    if not quantities:
+        return False
+    acceleration = quantities.get("a")
+    return acceleration is not None and acceleration.value != 0
+
+
+# Symbols whose value cannot be negative when a quadratic hands back a +/-
+# pair. Elapsed time is never negative; the speed symbols are magnitudes as
+# this corpus phrases them. Deliberately excludes "s" and "a", whose signs
+# carry real physical meaning (displacement below the launch point, downward
+# acceleration) and must survive untouched.
+_NON_NEGATIVE_SYMBOLS = {
+    "t",
+    "time",
+    "u",
+    "v",
+    "speed",
+    "avg_v",
+    "v1",
+    "v2",
+    "relative_speed",
 }
 
 
@@ -58,9 +93,17 @@ class ReasoningResult:
 class PhysicsReasoner:
     """Layer 2. Deterministic graph traversal, SymPy solving, and validation."""
 
-    def __init__(self, graph: PhysicsKnowledgeGraph, unit_validator: UnitValidator | None = None):
+    def __init__(
+        self,
+        graph: PhysicsKnowledgeGraph,
+        unit_validator: UnitValidator | None = None,
+        verifier: DimensionalVerifier | None = None,
+    ):
         self.graph = graph
+        # Kept as a public attribute because CalcMatePipeline reuses it to
+        # validate a borrowed case-fallback answer (phase 5b).
         self.unit_validator = unit_validator or UnitValidator()
+        self.verifier = verifier or DimensionalVerifier(self.unit_validator)
 
     def solve(
         self,
@@ -74,7 +117,7 @@ class PhysicsReasoner:
             constrained_problem, constraints_fired = self.resolve_constraints(problem, retrieved_cases or [], trace)#all possible implications are made and whether a suitable equation is present or not is also verified,the modified problem with all new implications are returned
             raw_steps = self.solve_with_sympy(constrained_problem, working_set, trace, constraints_fired)#return SolutionStep(equation_node,law_node,equation,substitution,solved_symbol=problem.target,value,unit)
             steps = self.reconstruct_solution_path(raw_steps, overlay, trace)#redo the steps based on the overlay
-            unit_validation = self.validate_units(steps[-1], trace)#validates units using dimensionality checking using pint
+            unit_validation = self.validate_units(steps, constrained_problem, trace)#dimensional balance + per-substitution consistency + final-answer check
             if not unit_validation.is_valid:
                 raise ReasoningError(unit_validation.message)
         except ReasoningError as exc:
@@ -178,7 +221,9 @@ class PhysicsReasoner:
         solution_steps: list[SolutionStep] = []
 
         for iteration in range(MAX_ITER):                              # Stop 3: safety limit
-            enabled = self._find_enabled_equations(knowns, working_set["equations"], fired)
+            enabled = self._find_enabled_equations(
+                knowns, working_set["equations"], fired, problem.quantities
+            )
 
             new_discoveries = False
             for node_id, attrs, sym in enabled:
@@ -194,11 +239,15 @@ class PhysicsReasoner:
                     continue
 
                 knowns.add(sym)
+                # Feed the *unrounded* value forward. step.value is rounded to
+                # 4dp for display; chaining that through several derivations
+                # compounds the rounding into the final answer.
+                derived_value = step.raw_value if step.raw_value is not None else step.value
                 problem = replace(
                     problem,
                     quantities={
                         **problem.quantities,
-                        sym: Quantity(sym, step.value, step.unit, source_text="derived"),
+                        sym: Quantity(sym, derived_value, step.unit, source_text="derived"),
                     },
                 )
                 solution_steps.append(step)
@@ -268,16 +317,30 @@ class PhysicsReasoner:
         )
         return chosen
 
-    def validate_units(self, step: SolutionStep, trace: list[PhaseTrace]) -> UnitValidation:#validates units using dimensionality checking using pint
-        validation = self.unit_validator.validate(step)
+    def validate_units(
+        self,
+        steps: list[SolutionStep],
+        problem: ExtractedProblem,
+        trace: list[PhaseTrace],
+    ) -> UnitValidation:
+        # Three checks, not one: every equation used must be dimensionally
+        # balanced, every substituted quantity must carry a dimensionally
+        # consistent unit, and the final answer must still pass the original
+        # unit check. A borrowed or mis-selected equation can produce a final
+        # value whose unit *looks* right while the derivation was not.
+        report = self.verifier.verify(steps, problem.quantities)
         trace.append(
             PhaseTrace(
                 phase="7_unit_validation",
-                status="ok" if validation.is_valid else "blocked",
-                detail=validation.message,
+                status="ok" if report.is_valid else "blocked",
+                detail=report.summary(),
             )
         )
-        return validation
+        if not report.is_valid:
+            # Surface the strengthened verdict, which can fail even when the
+            # final unit alone looks fine.
+            return replace(report.final_answer, is_valid=False, message=report.summary())
+        return report.final_answer
 
     def _apply_trigger_constraints(
         self,
@@ -380,7 +443,7 @@ class PhysicsReasoner:
         for _ in range(20):
             new_sym = False
             for node_id, attrs in equations:
-                if not self._equation_conditions_met(node_id, fired):
+                if not self._equation_conditions_met(node_id, fired, problem.quantities):
                     continue
                 symbols = set(attrs["symbols"])
                 unknowns = symbols - known
@@ -395,17 +458,30 @@ class PhysicsReasoner:
                 break
         return False
 
-    def _equation_conditions_met(self, node_id: str, fired_constraints: set[str]) -> bool:
+    def _equation_conditions_met(
+        self,
+        node_id: str,
+        fired_constraints: set[str],
+        quantities: dict[str, Quantity] | None = None,
+    ) -> bool:
         required = _CONDITIONAL_EQUATIONS.get(node_id)
-        return required is None or required in fired_constraints
+        if required is not None and required not in fired_constraints:
+            return False
+        if node_id in _ZERO_ACCELERATION_EQUATIONS and _has_nonzero_acceleration(quantities):
+            return False
+        return True
 
     def _find_enabled_equations(
-        self, knowns: set[str], equations: list[tuple[str, dict]], fired_constraints: set[str] | None = None
+        self,
+        knowns: set[str],
+        equations: list[tuple[str, dict]],
+        fired_constraints: set[str] | None = None,
+        quantities: dict[str, Quantity] | None = None,
     ) -> list[tuple[str, dict, str]]:
         fired = fired_constraints or set()
         enabled = []
         for node_id, attrs in equations:
-            if not self._equation_conditions_met(node_id, fired):
+            if not self._equation_conditions_met(node_id, fired, quantities):
                 continue
             symbols = set(attrs["symbols"])
             unknowns = symbols - knowns
@@ -452,12 +528,29 @@ class PhysicsReasoner:
             solved_symbol=target,
             value=round(value, 4),
             unit=UNIT_BY_SYMBOL.get(target, ""),
+            raw_value=float(value),
         )
 
     def _choose_root(self, unknown: str, solved: list[sp.Expr]) -> float:
+        """Pick the physically meaningful root of a quadratic.
+
+        The second and third equations of motion are quadratic, so SymPy
+        returns a +/- pair and taking solved[0] lands on the negative one
+        about half the time ("t = -8 s", "u = -19.6 m/s"). Which sign is
+        physical depends on the symbol:
+
+        * ``t`` is elapsed time and can never be negative.
+        * A speed the problem asks for ("what was its initial velocity",
+          "find the final speed") is a magnitude in this 1D corpus.
+        * ``s`` and ``a`` are signed on purpose - displacement below the
+          launch point and downward acceleration are both meaningful - so
+          their roots are left alone.
+        """
         numeric = [float(value) for value in solved]
-        if unknown == "v" and len(numeric) > 1:
-            positive = [value for value in numeric if value >= 0]
-            if positive:
-                return min(positive)
+        if len(numeric) <= 1:
+            return numeric[0]
+        if unknown in _NON_NEGATIVE_SYMBOLS:
+            non_negative = [value for value in numeric if value >= 0]
+            if non_negative:
+                return min(non_negative)
         return numeric[0]

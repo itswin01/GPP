@@ -25,7 +25,7 @@ from calcmate.overlay import load_overlay
 from calcmate.postgres_logging import AttemptLogger, NoopAttemptLogger
 from calcmate.reasoning import PhysicsReasoner, ReasoningError, ReasoningResult
 from calcmate.retrieval import CaseRetriever, FaissCaseRetriever, InMemoryCaseRetriever, TfidfCaseRetriever
-from calcmate.units import convert as convert_si_value
+from calcmate.units import convert, parse_requested_unit, to_si
 
 
 class Extractor(Protocol):
@@ -106,7 +106,16 @@ class CalcMatePipeline:
                 )
             )
             retrieved_cases = self._phase_2_retrieve(extracted, phase_trace)
-            reasoning, fallback_case_id = self._phase_5b_case_fallback(extracted, retrieved_cases, phase_trace, exc)
+            reasoning, fallback_case_id = self._phase_5b_case_fallback(extracted, retrieved_cases, phase_trace)
+            if reasoning is None:
+                # Neither the graph nor any similar case produced a *verified*
+                # answer. Report that plainly instead of emitting an unverified
+                # number - a wrong answer is worse than no answer here.
+                solution = self._build_unresolved_solution(
+                    extracted, overlay.overlay_id, retrieved_cases, phase_trace, exc
+                )
+                self._phase_9_log(solution, phase_trace)
+                return solution
 
         reasoning = self._apply_requested_output_unit(reasoning)
         phase_trace.extend(reasoning.phase_trace)# a copy of the phase trace
@@ -122,28 +131,87 @@ class CalcMatePipeline:
         extracted: ExtractedProblem,
         retrieved_cases,
         phase_trace: list[PhaseTrace],
-        original_error: ReasoningError,
-    ) -> tuple[ReasoningResult, str | None]:
+    ) -> tuple[ReasoningResult | None, str | None]:
         """The graph solver couldn't reach the target on its own. Try to
         borrow a solving method from a structurally similar solved case
-        instead of failing outright."""
+        instead of failing outright.
+
+        Returns ``(None, None)`` when no case yields a *verified* answer; the
+        caller then reports the attempt as unresolved.
+        """
         fallback_trace: list[PhaseTrace] = []
         result = self.fallback_solver.solve(extracted, retrieved_cases, fallback_trace)
         phase_trace.extend(fallback_trace)
         if result is None:
-            raise original_error
+            return None, None
 
-        unit_validation = self.reasoner.unit_validator.validate(result.steps[-1])
+        # A borrowed answer gets *more* scrutiny than a graph-derived one, not
+        # less: run the full dimensional verification rather than the
+        # final-step unit check alone.
+        borrowed = replace(extracted, quantities=extracted.quantities)
+        report = self.reasoner.verifier.verify(result.steps, borrowed.quantities)
+        if not report.is_valid:
+            phase_trace.append(
+                PhaseTrace(
+                    phase="5c_case_fallback_rejected",
+                    status="blocked",
+                    detail=(
+                        f"Case {result.source_case_id!r} produced an answer that failed "
+                        f"verification: {report.summary()}"
+                    ),
+                )
+            )
+            return None, None
+
         reasoning = ReasoningResult(
             problem=extracted,
             constraints_fired=result.applied_constraints,
             steps=result.steps,
             law_nodes=[step.law_node for step in result.steps],
-            unit_validation=unit_validation,
+            unit_validation=report.final_answer,
             phase_trace=[],
             was_under_constrained=True,
         )
         return reasoning, result.source_case_id
+
+    def _build_unresolved_solution(
+        self,
+        extracted: ExtractedProblem,
+        overlay_id: str,
+        retrieved_cases,
+        phase_trace: list[PhaseTrace],
+        error: Exception,
+    ) -> Solution:
+        target = extracted.target
+        phase_trace.append(
+            PhaseTrace(
+                phase="5d_unresolved",
+                status="blocked",
+                detail=f"No verified solution for {target!r}: {error}",
+            )
+        )
+        phase_trace.append(
+            PhaseTrace(phase="8_narration", status="skipped", detail="No verified solution to narrate.")
+        )
+        return Solution(
+            problem=extracted,
+            overlay_id=overlay_id,
+            applied_constraints=[],
+            steps=[],
+            answer_symbol=target,
+            answer_value=None,
+            answer_unit="",
+            law_nodes=[],
+            narration=(
+                f"Could not produce a verified answer for {target!r}. The problem appears "
+                "under-constrained and no verified fallback was found. Human review is recommended."
+            ),
+            retrieved_cases=retrieved_cases,
+            unit_validation=UnitValidation("", "", False, str(error)),
+            phase_trace=phase_trace,
+            was_under_constrained=True,
+            was_unresolved=True,
+        )
 
     def _phase_1_extract(self, text: str, trace: list[PhaseTrace]) -> ExtractedProblem:
         extracted = self.extractor.extract(text) #return ExtractedProblem(raw_text=text,quantities=quantities,target=target,trigger_phrases=triggers,domain_hint=domain_hint,)  this is wat is store inside extracted
@@ -169,18 +237,15 @@ class CalcMatePipeline:
         converted: dict[str, Quantity] = {}
         notes: list[str] = []
         for symbol, quantity in extracted.quantities.items():
-            si_unit = UNIT_BY_SYMBOL.get(symbol)
-            if not si_unit or quantity.unit == si_unit:
+            # to_si() looks up the symbol's canonical SI unit and returns the
+            # value unchanged when there is nothing to convert or the unit is
+            # unrecognized - downstream unit validation then flags the
+            # mismatch rather than silently treating it as already-SI.
+            si_value, si_unit = to_si(quantity.value, quantity.unit, symbol)
+            if si_unit == quantity.unit and si_value == quantity.value:
                 converted[symbol] = quantity
                 continue
-            si_value = convert_si_value(quantity.value, quantity.unit, si_unit)
-            if si_value is None:
-                # Unrecognized unit - leave it; unit validation downstream
-                # will flag the mismatch rather than silently treating the
-                # raw value as if it were already SI.
-                converted[symbol] = quantity
-                continue
-            converted[symbol] = replace(quantity, value=round(si_value, 6), unit=si_unit)
+            converted[symbol] = replace(quantity, value=si_value, unit=si_unit)
             notes.append(f"{symbol}: {quantity.value:g} {quantity.unit} -> {si_value:g} {si_unit}")
 
         trace.append(
@@ -202,24 +267,6 @@ class CalcMatePipeline:
             )
         )
         return cases#contains the top 3-5 matches
-
-    # Regex-detected "in <unit>" phrasing for each unit the answer might be
-    # requested in. New spellings map onto the same handful of canonical
-    # units without each needing its own accepted-string entry elsewhere.
-    _OUTPUT_UNIT_PATTERNS: list[tuple[str, str]] = [
-        (r"\bin\s+(?:kilometers?|kilometres?|km)\s*(?:per|/)\s*(?:hour|h)\b", "km/h"),
-        (r"\bin\s+kmph\b", "km/h"),
-        (r"\bin\s+(?:kilometers?|kilometres?|km)\s*(?:per|/)\s*(?:minute|min)\b", "km/min"),
-        (r"\bin\s+(?:centimeters?|centimetres?|cm)\s*(?:per|/)\s*(?:second|s)\b", "cm/s"),
-        (r"\bin\s+(?:millimeters?|millimetres?|mm)\b", "mm"),
-        (r"\bin\s+(?:centimeters?|centimetres?|cm)\b", "cm"),
-        (r"\bin\s+(?:kilometers?|kilometres?|km)\b", "km"),
-        (r"\bin\s+(?:meters?|metres?)\s*(?:per|/)\s*(?:second|s)\b", "m/s"),
-        (r"\bin\s+(?:meters?|metres?)\b", "m"),
-        (r"\bin\s+(?:milliseconds?|ms)\b", "ms"),
-        (r"\bin\s+(?:minutes?|min)\b", "min"),
-        (r"\bin\s+(?:hours?|hrs?|h)\b", "h"),
-    ]
 
     def _apply_requested_output_unit(self, reasoning: ReasoningResult) -> ReasoningResult:
         """Phase 7b: the target was already solved entirely in SI (phase 5).
@@ -265,17 +312,20 @@ class CalcMatePipeline:
         return replace(reasoning, steps=steps, unit_validation=unit_validation, phase_trace=trace)
 
     def _requested_output_unit(self, text: str) -> str | None:
-        lowered = text.lower()
-        for pattern, unit in self._OUTPUT_UNIT_PATTERNS:
-            if re.search(pattern, lowered):
-                return unit
-        return None
+        # All unit handling - the accepted "in <unit>" spellings included -
+        # lives in calcmate.units so there is one place to extend.
+        return parse_requested_unit(text)
 
     def _convert_step_unit(self, step: SolutionStep, requested_unit: str) -> SolutionStep | None:
-        converted_value = convert_si_value(step.value, step.unit, requested_unit)
+        if step.unit == requested_unit:
+            return step
+        # Convert from the full-precision value so the result is not degraded
+        # by the 4-dp display rounding already applied to step.value.
+        base_value = step.raw_value if step.raw_value is not None else step.value
+        converted_value = convert(base_value, step.unit, requested_unit)
         if converted_value is None:
             return None
-        return replace(step, value=round(converted_value, 4), unit=requested_unit)
+        return replace(step, value=round(converted_value, 4), unit=requested_unit, raw_value=converted_value)
 
     def _phase_8_narrate(self, reasoning: ReasoningResult, overlay, trace: list[PhaseTrace]) -> str:
         narration = self.narrator.narrate(
@@ -302,6 +352,7 @@ class CalcMatePipeline:
                 constraints_fired=solution.applied_constraints,
                 was_under_constrained=solution.was_under_constrained,
                 was_contradiction=solution.was_contradiction,
+                was_unresolved=solution.was_unresolved,
             )
         )
         trace.append(
