@@ -39,3 +39,9 @@ Thumbs.db
 .vscode/
 .idea/
 .claude/
+
+# Frontend (Vite + React). dist/ is a build artifact; rebuild with
+# `npm run build` in frontend/ — FastAPI serves it when present.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/

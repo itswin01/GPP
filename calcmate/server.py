@@ -18,8 +18,18 @@ load_dotenv()
 app = FastAPI(title="CalcMate")
 pipeline: CalcMatePipeline | None = None
 attempt_store = AttemptStore()
-web_dir = PROJECT_ROOT / "web"
-app.mount("/static", StaticFiles(directory=web_dir), name="static")
+
+# Serve the React build when it exists, else the original plain-HTML page.
+# `npm run build` in frontend/ produces frontend/dist; until then the legacy
+# web/ directory keeps the app runnable with no Node toolchain installed.
+REACT_DIST = PROJECT_ROOT / "frontend" / "dist"
+LEGACY_WEB = PROJECT_ROOT / "web"
+web_dir = REACT_DIST if (REACT_DIST / "index.html").exists() else LEGACY_WEB
+
+app.mount("/static", StaticFiles(directory=LEGACY_WEB), name="static")
+if (REACT_DIST / "assets").is_dir():
+    # Vite emits hashed bundles under /assets and references them absolutely.
+    app.mount("/assets", StaticFiles(directory=REACT_DIST / "assets"), name="assets")
 
 
 class SolveRequest(BaseModel):
@@ -64,3 +74,23 @@ def solve(request: SolveRequest) -> dict:
 @app.get("/api/weak-nodes")
 def weak_nodes() -> list[dict]:
     return attempt_store.weak_nodes()
+
+
+# Must be declared LAST: FastAPI matches routes in definition order, so an
+# earlier catch-all would swallow every /api/* request above.
+@app.get("/{full_path:path}")
+def spa_fallback(full_path: str) -> FileResponse:
+    """Serve the SPA for client-side routes like /dashboard and /solve.
+
+    React Router owns those paths in the browser, but a refresh or a pasted
+    link asks the server for them directly. Any non-API path that is not a
+    real file on disk returns index.html and lets the router take over.
+    """
+    if full_path.startswith("api/"):
+        raise HTTPException(status_code=404, detail="Not found")
+
+    candidate = web_dir / full_path
+    if full_path and candidate.is_file():
+        return FileResponse(candidate)
+
+    return FileResponse(web_dir / "index.html")
